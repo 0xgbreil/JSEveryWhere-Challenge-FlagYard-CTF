@@ -1,6 +1,8 @@
 # JSEveryWhere Challenge | FlagYard CTF
 A short write-up for the **JSEveryWhere** DFIR challenge, including the original challenge file and a PowerShell script that automates the deobfuscation process.
 
+Video Link -> https://youtu.be/cqdaQZKe2t0?si=GHmvOVaz7Ko3OO2O
+
 ![Challenge Preview](1.png)
 
 
